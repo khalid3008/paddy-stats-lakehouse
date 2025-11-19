@@ -205,3 +205,17 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Local data files (we only keep tiny samples in /samples)
+data/
+*.csv
+*.parquet
+*.xlsx
+
+# Virtual envs
+.venv/
+venv/
+
+# VS Code
+.vscode/
+
