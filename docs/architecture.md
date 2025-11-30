@@ -1,103 +1,43 @@
-# Paddy Statistics Lakehouse – Architecture
+# Paddy Statistics Lakehouse (Sri Lanka Maha & Yala)
 
-This document describes the end-to-end architecture of the Paddy Statistics Lakehouse project on AWS.
-
-It explains:
-
-- The main components (S3, Lambda, Athena, IAM).
-- How data flows from source files to Silver.
-- How the system is intended to be used and extended.
+End-to-end data engineering project that builds a lakehouse-style pipeline on AWS for Sri Lankan paddy statistics (Maha/Yala seasons: production, harvested extent, sown extent, and yield by district and year).
 
 ---
 
-## 1. High-Level Overview
+## Architecture (High Level)
 
-The project ingests static CSV/Excel files containing Sri Lankan paddy statistics (Maha/Yala seasons), cleans and normalises them with a Lambda function, writes partitioned Parquet to S3 (Silver layer), and exposes the data via Athena for analysis.
-
-High-level flow:
-
-1. Source CSV/Excel files are stored in an S3 bucket.
-2. A Python AWS Lambda (`lambda_function.py`) reads each file, cleans/normalises it, and writes Silver data back to S3 as Parquet.
-3. An Athena external table (`paddy_db.paddy_stats`) points at the Silver Parquet data and uses Hive partitions for efficient querying.
-4. (Planned) Gold views/tables will sit on top of Silver for BI-friendly consumption.
+- **Data Lake**: S3 (`bronze` → `silver` → `silver_clean` → `gold`)
+- **Compute**: AWS Lambda (Python) and Athena (CTAS SQL)
+- **Catalog**: AWS Glue Data Catalog / Hive-style partitions
+- **Query**: Athena on top of S3 Silver / Silver Clean / Gold layers
+- **Output**: District-level and national-level fact tables + trend views
 
 ---
 
-## 2. Components
+## Pipeline Stages
 
-### 2.1 S3 – Data Lake Storage
+### 1. Ingestion & Cleaning (Silver)
 
-- **Bucket: khalid-crop-yield-proj
-- **Key prefixes:**
-  - Raw / incoming files: s3://khalid-crop-yield-proj/bronze/paddy_stats/
-  - Silver layer (configured via `SILVER_PREFIX`, default: `silver/paddy_stats/`):
-  
+- Raw Excel/CSV files uploaded to `s3://<bucket>/bronze/paddy_stats/`.
+- AWS Lambda is triggered or invoked manually with the S3 key.
+- Lambda responsibilities:
+  - Read file from S3.
+  - Detect and flatten multi-row headers.
+  - Drop annotation/footer rows.
+  - Identify the district column.
+  - Melt wide sheets into long (tidy) format.
+  - Extract:
+    - `metric_name` (Production, Sown Extent, Harvested Extent, Average Yield)
+    - `season` (Maha/Yala from filename)
+    - `year_label`
+    - `subcategory` (MAJOR, MINOR, RAINFED, TOTAL)
+    - `harvest_year` (handles ranges like `1978/1979`).
+  - Clean numeric values.
+  - Write partitioned Parquet to Silver:
+
     - `silver/paddy_stats/metric_name=<metric_name>/season=<Maha|Yala|unknown>/harvest_year=<YYYY|unknown>/part-<checksum>.parquet`
 
-S3 acts as the **data lake**:
-
-- Raw/static source files live here.
-- Silver layer Parquet files are written here.
-- Athena reads directly from the Silver prefix.
-
----
-
-### 2.2 AWS Lambda – Ingestion & Silver Transformation
-
-- **File:** `src/lambda/lambda_function.py`
-- **Runtime:** Python
-- **Libraries:** `boto3`, `pandas`, `re`, `hashlib`, `io`, `os`, `json`
-- **Configuration:**
-  - `DATA_BUCKET` – S3 bucket containing raw files and where Silver is written.
-  - `SILVER_PREFIX` – S3 prefix for Silver layer (default: `silver/paddy_stats/`).
-
-**Responsibilities:**
-
-1. **Read source file from S3**
-   - Triggered either by:
-     - S3 event (`Records` in event), or
-     - Manual/event-based invocation with `{"s3_key": "<path/to/file>"}` and `DATA_BUCKET` set.
-
-2. **Detect captions and headers**
-   - Uses functions:
-     - `detect_caption_row_wide`
-     - `detect_header_idx`
-     - `has_two_level_header`
-   - Handles messy multi-row headers and caption rows.
-
-3. **Flatten column headers**
-   - Uses `flatten_columns` to convert multi-level headers to a single row of names.
-
-4. **Remove annotation rows**
-   - Uses `is_annotation_row` to drop footnote-style rows with long text and no numeric content.
-
-5. **Identify district column**
-   - Searches for a column containing "district".
-   - If none found, assigns `district = 'ALL_ISLAND'` to all rows.
-
-6. **Reshape to long / tidy format**
-   - Uses `pd.melt()` to convert wide year/subcategory columns into rows:
-     - `district`
-     - `year_col` (temporary)
-     - `value`
-
-7. **Derive year and subcategory**
-   - `split_year_and_subcat` → `year_label`, `subcategory`
-   - `harvest_year_from` → `harvest_year` (handles pairs like `1978/1979` with season awareness).
-
-8. **Unit and metric detection**
-   - `parse_from_name(key)` → `metric_name`, default unit, season (from file name).
-   - `maybe_unit_from_caption(cap_text, unit)` → refine unit from caption if available.
-
-9. **Clean numeric values**
-   - Strip commas and whitespace.
-   - Convert to numeric via `pd.to_numeric(errors="coerce")`.
-
-10. **Write partitioned Parquet to Silver**
-    - For each `harvest_year` group, write to:
-      - `silver/paddy_stats/metric_name=<metric_name>/season=<season or 'unknown'>/harvest_year=<YYYY or 'unknown'>/part-<checksum>.parquet`
-
-**Output schema per row (Silver):**
+Silver schema:
 
 - `district`
 - `value`
@@ -110,75 +50,110 @@ S3 acts as the **data lake**:
 
 ---
 
-### 2.3 Athena – Query Layer
+### 2. Normalisation (Silver Clean)
 
-- **Workgroup:** `paddy_wg`
-- **Database:** `paddy_db`
-- **Silver table:** `paddy_stats` (external)
+- Implemented via Athena CTAS: `paddy_db.paddy_stats_clean`.
+- Reads from `paddy_db.paddy_stats` and writes to:
 
-The external table maps to the Silver S3 prefix and uses **Hive partitions**:
+  - `s3://<bucket>/silver/paddy_stats_clean/`
 
-- `metric_name`
-- `season`
-- `harvest_year`
+- Transformations:
+  - Standardise district names (trim + uppercase).
+  - Fix spelling variants (e.g. `KILINOCHCHI`, `KILLINOCHCHI`, `KILINOCHCHIYA` → `KILINOCHCHI`).
+  - Normalise `MAHAWELI 'H'` variants.
+  - Remove non-district rows:
+    - `SRI LANKA` (national totals)
+    - `HIGHLAND PADDY` (product type, not a district)
+    - `DISTRICT` header rows.
+  - Remove blank districts.
+- Partitioned by:
+  - `season`
+  - `harvest_year`
 
-This allows:
-
-- Filtering by metric (e.g. Production only).
-- Seasonal comparisons (Maha vs Yala).
-- Time-based analysis by year.
-
-**Important:**
-
-- After new partitions are written to Silver, you may need to run:
-  - `MSCK REPAIR TABLE paddy_db.paddy_stats;`
-  - or `ALTER TABLE ... ADD PARTITION ...` if doing it manually.
+`paddy_stats_clean` is the authoritative Silver dataset used by Gold.
 
 ---
 
-## 3. Data Flow Summary
+### 3. Gold – District-Level Fact
 
-End-to-end flow:
+**Table:** `paddy_db.fact_paddy_district_year_season`  
+**Grain:** `district × harvest_year × season`
 
-1. **Upload source file**  
-   A CSV/Excel file (Maha or Yala; Production/Extent/Yield) is uploaded to the `DATA_BUCKET`.
+Built from `paddy_stats_clean` with the following rules:
 
-2. **Invoke Lambda**
-   - Either via S3 event trigger, or manually with a payload specifying `s3_key`.
+- Uses only `subcategory = 'TOTAL'` / `'ALL'` where subcategories exist.
+- Excludes rows where:
+  - `district` is NULL
+  - `district` is blank
+  - `district = 'SRI LANKA'`
+- Columns:
+  - `district`
+  - `sown_extent_ha`
+  - `harvested_extent_ha`
+  - `production_mt`
+  - `yield_reported_kg_per_ha`
+  - `created_at`
+  - `harvest_year`
+  - `season`
+- Partitioned by:
+  - `harvest_year`
+  - `season`
 
-3. **Lambda processing**
-   - Reads file from S3.
-   - Detects captions and headers, flattens columns.
-   - Drops annotation rows.
-   - Identifies `district` column (or substitutes `ALL_ISLAND`).
-   - Melts to long format.
-   - Derives `year_label`, `subcategory`, `harvest_year`.
-   - Detects metric, unit, and season from file name + caption.
-   - Cleans numeric values.
-   - Writes partitioned Parquet to the Silver prefix.
-
-4. **Catalog update**
-   - Athena’s Glue Data Catalog is updated (via `MSCK REPAIR TABLE` or `ALTER TABLE ... ADD PARTITION`) so new partitions are discoverable.
-
-5. **Querying in Athena**
-   - Analysts and you can query `paddy_db.paddy_stats` in the `paddy_wg` workgroup.
-   - Queries can filter by `metric_name`, `season`, and `harvest_year`.
-
-6. **(Planned) Gold Layer**
-   - Future: a Gold view/table (e.g. `gld_vw_paddy_stats` or `gld_paddy_stats`) will be created on top of `paddy_stats` for BI and dashboard consumption.
+This table is the main Gold fact for district-level analysis across seasons and years.
 
 ---
 
-## 4. Operational Characteristics
+### 4. Gold – National-Level Fact
 
-- **Static dataset:**  
-  - Source files are static paddy statistics.  
-  - No periodic ingestion or scheduling (no EventBridge / cron jobs yet).
+**Table:** `paddy_db.fact_paddy_national_year_season`  
+**Grain:** `Sri Lanka × harvest_year × season`
 
-- **Execution model:**  
-  - Lambda can be invoked on-demand per file.
-  - Suitable for “backfill once and query many times” workflows.
+Built from `fact_paddy_district_year_season`:
 
-- **Logging & debugging:**
-  - Lambda prints debug logs (e.g. dropped annotation rows, final column list).
-  - These logs are visible in CloudWatch for troubleshooting.
+- Aggregates:
+  - `national_sown_extent_ha = SUM(sown_extent_ha)`
+  - `national_harvested_extent_ha = SUM(harvested_extent_ha)`
+  - `national_production_mt = SUM(production_mt)`
+- Computes:
+  - `national_yield_reported_kg_per_ha` as a **weighted average** of district `yield_reported_kg_per_ha`, weighted by `harvested_extent_ha`.
+- Columns:
+  - `harvest_year`
+  - `season`
+  - `national_sown_extent_ha`
+  - `national_harvested_extent_ha`
+  - `national_production_mt`
+  - `national_yield_reported_kg_per_ha`
+  - `created_at`
+- Partitioned by:
+  - `harvest_year`
+  - `season`
+
+This table supports national-level Maha vs Yala trend analysis.
+
+---
+
+### 5. Analytical Views (Trends)
+
+**View:** `paddy_db.v_paddy_national_trends`
+
+- Built on top of `fact_paddy_national_year_season`.
+- Adds year-on-year metrics using window functions (`LAG`), such as:
+  - `production_yoy_pct`
+  - `national_yield_yoy_pct`
+  - `harvested_extent_yoy_pct`
+- Used as a BI-ready layer for tools like Athena, Tableau, or QuickSight.
+
+---
+
+## Summary
+
+This project demonstrates:
+
+- A full lakehouse-style architecture on AWS (S3 + Lambda + Athena + Glue).
+- Multi-layer design: Bronze → Silver → Silver Clean → Gold.
+- Use of partitioned Parquet on S3 for efficient querying.
+- Data cleaning and dimensional standardisation:
+  - District normalisation (Kilinochchi, Mahaweli H, removal of non-district rows).
+  - Subcategory handling (Major/Minor/Rainfed/Total, with Gold using only TOTAL).
+- Construction of both district-level and national-level fact tables.
+- Addition of analytical views for year-on-year trend analysis across 40+ years of Sri Lankan paddy statistics.
