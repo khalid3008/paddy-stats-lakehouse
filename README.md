@@ -30,9 +30,8 @@ End-to-end data engineering project that builds a small lakehouse-style pipeline
 
 - `src/lambda/` — Lambda functions for ingest/transform
 - `src/glue/` — (Later) Glue / PySpark jobs for heavier transforms
-- `sql/` — Athena DDL and example analysis queries
+- `sql/athena` — Athena DDL and example analysis queries
 - `docs/` — Architecture, data model, and runbook
-- `samples/` — Tiny, anonymised sample files mirroring source schema
 
 ## Key Learnings (for myself)
 
